@@ -2,7 +2,7 @@ package model
 
 import (
 	"errors"
-	"math/rand"
+	"fmt"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -67,10 +67,19 @@ func UserCheckin(userId int) (*Checkin, error) {
 		return nil, errors.New("今日已签到")
 	}
 
-	// 计算随机额度奖励
-	quotaAwarded := setting.MinQuota
-	if setting.MaxQuota > setting.MinQuota {
-		quotaAwarded = setting.MinQuota + rand.Intn(setting.MaxQuota-setting.MinQuota+1)
+	// 读取用户当前额度
+	var user User
+	if err := DB.Select("id", "quota").First(&user, "id = ?", userId).Error; err != nil {
+		return nil, errors.New("获取用户信息失败")
+	}
+	// 自定义规则：额度不低于 MinQuotaForCheckin 时不允许签到
+	if user.Quota >= setting.MinQuotaForCheckin {
+		return nil, fmt.Errorf("当前额度 %d 不低于 %d，无需签到", user.Quota, setting.MinQuotaForCheckin)
+	}
+	// 自定义规则：签到把额度补充到 TopUpTargetQuota
+	quotaAwarded := setting.TopUpTargetQuota - user.Quota
+	if quotaAwarded < 0 {
+		quotaAwarded = 0
 	}
 
 	today := time.Now().Format("2006-01-02")
