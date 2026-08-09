@@ -73,7 +73,7 @@ func resolveChannelTestUserID(c *gin.Context) (int, error) {
 	return rootUser.Id, nil
 }
 
-func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool) testResult {
+func testChannel(ctx context.Context, channel *model.Channel, testUserID int, testModel string, endpointType string, isStream bool, keyIndex int) testResult {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -186,6 +186,23 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 			localErr:    newAPIError,
 			newAPIError: newAPIError,
 		}
+	}
+
+	// If a specific key index is requested (multi-key per-key test),
+	// override the key selected by GetNextEnabledKey so we can test
+	// individual keys regardless of their enabled/disabled status.
+	if keyIndex >= 0 && channel.ChannelInfo.IsMultiKey {
+		keys := channel.GetKeys()
+		if keyIndex >= len(keys) {
+			err := fmt.Errorf("key index %d out of range (total %d keys)", keyIndex, len(keys))
+			return testResult{
+				context:     c,
+				localErr:    err,
+				newAPIError: types.NewError(err, types.ErrorCodeChannelInvalidKey),
+			}
+		}
+		common.SetContextKey(c, constant.ContextKeyChannelKey, keys[keyIndex])
+		common.SetContextKey(c, constant.ContextKeyChannelMultiKeyIndex, keyIndex)
 	}
 
 	// Determine relay format based on endpoint type or request path
@@ -875,6 +892,12 @@ func TestChannel(c *gin.Context) {
 	testModel := c.Query("model")
 	endpointType := c.Query("endpoint_type")
 	isStream, _ := strconv.ParseBool(c.Query("stream"))
+	keyIndex := -1
+	if keyIndexStr := c.Query("key_index"); keyIndexStr != "" {
+		if ki, err := strconv.Atoi(keyIndexStr); err == nil && ki >= 0 {
+			keyIndex = ki
+		}
+	}
 	testUserID, err := resolveChannelTestUserID(c)
 	if err != nil {
 		common.ApiError(c, err)
@@ -885,7 +908,7 @@ func TestChannel(c *gin.Context) {
 	if c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
-	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream)
+	result := testChannel(requestCtx, channel, testUserID, testModel, endpointType, isStream, keyIndex)
 	if result.localErr != nil {
 		resp := gin.H{
 			"success": false,
@@ -952,7 +975,7 @@ func performChannelTests(ctx context.Context, channels []*model.Channel, testUse
 		}
 		isChannelEnabled := channel.Status == common.ChannelStatusEnabled
 		tik := time.Now()
-		result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel))
+		result := testChannel(ctx, channel, testUserID, "", "", shouldUseStreamForAutomaticChannelTest(channel), -1)
 		tok := time.Now()
 		milliseconds := tok.Sub(tik).Milliseconds()
 		if ctx != nil && ctx.Err() != nil {

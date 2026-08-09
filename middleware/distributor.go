@@ -30,6 +30,126 @@ type ModelRequest struct {
 	Group string `json:"group,omitempty"`
 }
 
+// 防滥用规则：请求输入 token 数的允许范围与累计删 key 封号阈值
+const (
+	minPromptTokensPerRequest = 20
+	maxPromptTokensPerRequest = 120000
+	maxTokenDeleteTimes       = 2
+)
+
+// enforcePromptTokenPolicy 在分发渠道前检查单次请求输入 token 数。
+// 低于 minPromptTokensPerRequest 或高于 maxPromptTokensPerRequest 时：
+// 直接删除当前 key 并返回"你的key已被SHO回收"；
+// 同一用户累计被删 maxTokenDeleteTimes 个 key 后禁用账号。
+// 返回 true 表示已响应并终止请求。
+func enforcePromptTokenPolicy(c *gin.Context, modelName string) bool {
+	if !constant.CountToken {
+		return false
+	}
+	tokenId := common.GetContextKeyInt(c, constant.ContextKeyTokenId)
+	userId := common.GetContextKeyInt(c, constant.ContextKeyUserId)
+	// 无 token / 无用户（如渠道测试、管理端请求）不处理
+	if tokenId == 0 || userId == 0 {
+		return false
+	}
+	// 仅对文本对话类请求生效（跳过图片/音频/嵌入/重排/实时语音等）
+	if !isTextRelayPath(c.Request.URL.Path) {
+		return false
+	}
+	promptTokens := estimatePromptTokens(c, modelName)
+	if promptTokens < 0 {
+		return false
+	}
+	if promptTokens >= minPromptTokensPerRequest && promptTokens <= maxPromptTokensPerRequest {
+		return false
+	}
+
+	common.SysLog(fmt.Sprintf("防滥用：userId=%d tokenId=%d，输入 token 数 %d 不在允许范围 [%d, %d]，删除 key",
+		userId, tokenId, promptTokens, minPromptTokensPerRequest, maxPromptTokensPerRequest))
+
+	if err := model.DeleteTokenById(tokenId, userId); err != nil {
+		common.SysError("防滥用：删除 token 失败: " + err.Error())
+	}
+
+	// 累计被删次数，达到上限封号
+	if user, err := model.GetUserById(userId, false); err == nil {
+		user.TokenDeletedCount++
+		if err := model.UpdateUserTokenDeletedCount(user.Id, user.TokenDeletedCount); err != nil {
+			common.SysError("防滥用：更新用户删 key 次数失败: " + err.Error())
+		}
+		if user.TokenDeletedCount >= maxTokenDeleteTimes {
+			common.SysLog(fmt.Sprintf("防滥用：userId=%d 累计删 key %d 次，禁用账号", user.Id, user.TokenDeletedCount))
+			if err := model.UpdateUserStatus(user.Id, common.UserStatusDisabled); err != nil {
+				common.SysError("防滥用：禁用用户失败: " + err.Error())
+			}
+		}
+	}
+
+	abortWithOpenAiMessage(c, http.StatusBadRequest, "你的key已被SHO回收", types.ErrorCodeInvalidRequest)
+	return true
+}
+
+// isTextRelayPath 判断是否为文本对话类请求路径
+func isTextRelayPath(path string) bool {
+	return strings.HasSuffix(path, "/chat/completions") ||
+		strings.HasSuffix(path, "/completions") ||
+		strings.HasSuffix(path, "/responses") ||
+		strings.HasSuffix(path, "/messages")
+}
+
+// estimatePromptTokens 从请求体估算单次请求的输入 token 数（轻量版，用于分发前检查）
+func estimatePromptTokens(c *gin.Context, modelName string) int {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return -1
+	}
+	body, err := storage.Bytes()
+	if err != nil {
+		return -1
+	}
+	text := collectPromptText(body)
+	return service.CountTextToken(text, modelName)
+}
+
+// collectPromptText 提取请求体中 messages/input 的文本内容用于 token 估算
+func collectPromptText(body []byte) string {
+	var sb strings.Builder
+	// OpenAI / Claude: messages[].content
+	if msgs := gjson.GetBytes(body, "messages"); msgs.IsArray() {
+		for _, m := range msgs.Array() {
+			writeContentToBuilder(&sb, m.Get("content"))
+		}
+	}
+	// Responses API: input[]（元素可为纯字符串或含 content 的对象）
+	if input := gjson.GetBytes(body, "input"); input.IsArray() {
+		for _, it := range input.Array() {
+			if it.Type == gjson.String {
+				sb.WriteString(it.String())
+				sb.WriteString(" ")
+			} else {
+				writeContentToBuilder(&sb, it.Get("content"))
+			}
+		}
+	}
+	return sb.String()
+}
+
+func writeContentToBuilder(sb *strings.Builder, content gjson.Result) {
+	if content.Type == gjson.String {
+		sb.WriteString(content.String())
+		sb.WriteString(" ")
+		return
+	}
+	if content.IsArray() {
+		for _, part := range content.Array() {
+			if t := part.Get("text"); t.Exists() {
+				sb.WriteString(t.String())
+				sb.WriteString(" ")
+			}
+		}
+	}
+}
+
 func Distribute() func(c *gin.Context) {
 	return func(c *gin.Context) {
 		var channel *model.Channel
@@ -37,6 +157,10 @@ func Distribute() func(c *gin.Context) {
 		modelRequest, shouldSelectChannel, err := getModelRequest(c)
 		if err != nil {
 			abortWithOpenAiMessage(c, http.StatusBadRequest, i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
+			return
+		}
+		// 防滥用规则：单次请求输入 token 数过小或过大时，删除 key 并返回提示
+		if enforcePromptTokenPolicy(c, modelRequest.Model) {
 			return
 		}
 		if ok {

@@ -83,6 +83,7 @@ type User struct {
 	OriginalPassword string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
 	DisplayName      string                     `json:"display_name" gorm:"index" validate:"max=20"`
 	Avatar           string                     `json:"avatar" gorm:"column:avatar"`
+	TokenDeletedCount int                       `json:"token_deleted_count" gorm:"column:token_deleted_count;type:int;default:0"` // 因输入 token 规则被删 key 的累计次数
 	Role             int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
 	Status           int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
 	Email            string                     `json:"email" gorm:"index" validate:"max=50"`
@@ -1447,4 +1448,26 @@ func RootUserExists() bool {
 		return false
 	}
 	return true
+}
+
+// UpdateUserTokenDeletedCount 更新用户因输入 token 规则被删 key 的累计次数
+func UpdateUserTokenDeletedCount(id int, count int) error {
+	if id == 0 {
+		return errors.New("id 为空！")
+	}
+	return DB.Model(&User{}).Where("id = ?", id).Update("token_deleted_count", count).Error
+}
+
+// UpdateUserStatus 更新用户状态（启用/禁用）并刷新缓存
+func UpdateUserStatus(id int, status int) error {
+	if id == 0 {
+		return errors.New("id 为空！")
+	}
+	if err := DB.Model(&User{}).Where("id = ?", id).Update("status", status).Error; err != nil {
+		return err
+	}
+	if err := updateUserStatusCache(id, status == common.UserStatusEnabled); err != nil {
+		common.SysLog("failed to update user status cache: " + err.Error())
+	}
+	return nil
 }

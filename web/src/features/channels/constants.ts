@@ -218,6 +218,8 @@ export const MULTI_KEY_CONFIRM_MESSAGES = {
   DISABLE: 'Disable this key?',
   ENABLE_ALL: 'Are you sure you want to enable all keys?',
   DISABLE_ALL: 'Are you sure you want to disable all enabled keys?',
+  DISABLE_FAILED:
+    'Disable all keys that failed the latest test? They will be marked as manually disabled.',
   DELETE_DISABLED:
     'Are you sure you want to delete all auto-disabled keys? This action cannot be undone.',
 } as const

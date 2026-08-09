@@ -16,30 +16,50 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { Loader2, Zap } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '@/components/ui/button'
 
-import type { MultiKeyConfirmAction } from '../../types'
+import type { MultiKeyConfirmAction, MultiKeyTestResult } from '../../types'
 
 type MultiKeyTableRowActionsProps = {
   keyIndex: number
   status: number
   canDelete: boolean
+  testResult?: MultiKeyTestResult
   onAction: (action: MultiKeyConfirmAction) => void
+  onTest: (keyIndex: number) => void
 }
 
 export function MultiKeyTableRowActions({
   keyIndex,
   status,
   canDelete,
+  testResult,
   onAction,
+  onTest,
 }: MultiKeyTableRowActionsProps) {
   const { t } = useTranslation()
   const isEnabled = status === 1
+  const isTesting = testResult?.status === 'testing'
 
   return (
-    <div className='flex justify-end gap-2'>
+    <div className='flex items-center justify-end gap-2'>
+      <Button
+        variant='outline'
+        size='sm'
+        onClick={() => onTest(keyIndex)}
+        disabled={isTesting}
+        title={t('Test this key')}
+      >
+        {isTesting ? (
+          <Loader2 className='mr-1 h-3.5 w-3.5 animate-spin' />
+        ) : (
+          <Zap className='mr-1 h-3.5 w-3.5' />
+        )}
+        {t('Test')}
+      </Button>
       {isEnabled ? (
         <Button
           variant='outline'

@@ -17,8 +17,8 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQueryClient } from '@tanstack/react-query'
-import { Loader2, RefreshCw, Trash2, Power, PowerOff } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { Loader2, RefreshCw, Trash2, Power, PowerOff, Zap } from 'lucide-react'
+import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -60,7 +60,8 @@ import {
   getMultiKeyConfirmMessage,
   isDestructiveAction,
 } from '../../lib'
-import type { KeyStatus, MultiKeyConfirmAction } from '../../types'
+import { handleTestChannel } from '../../lib/channel-actions'
+import type { KeyStatus, MultiKeyConfirmAction, MultiKeyTestResult } from '../../types'
 import { useChannels } from '../channels-provider'
 import { StatisticsCard } from './multi-key-statistics-card'
 import { MultiKeyTableRowActions } from './multi-key-table-row-actions'
@@ -100,6 +101,24 @@ export function MultiKeyManageDialog({
   const [confirmAction, setConfirmAction] =
     useState<MultiKeyConfirmAction | null>(null)
   const [isPerformingAction, setIsPerformingAction] = useState(false)
+
+  // Per-key test state: keyIndex -> test result
+  const [testResults, setTestResults] = useState<
+    Map<number, MultiKeyTestResult>
+  >(new Map())
+  const [isTestingAll, setIsTestingAll] = useState(false)
+  const failedTestKeyIndexes = Array.from(testResults.values())
+    .filter((result) => result.status === 'error')
+    .map((result) => result.keyIndex)
+    .sort((a, b) => a - b)
+
+  // Reset test results when dialog opens
+  useEffect(() => {
+    if (open) {
+      setTestResults(new Map())
+      setIsTestingAll(false)
+    }
+  }, [open, currentRow?.id])
 
   // Reset and load data when dialog opens
   useEffect(() => {
@@ -173,7 +192,52 @@ export function MultiKeyManageDialog({
 
     setIsPerformingAction(true)
     try {
-      const { type, keyIndex } = confirmAction
+      const { type, keyIndex, keyIndexes } = confirmAction
+
+      if (type === 'disable-failed') {
+        const indexes = Array.from(new Set(keyIndexes || []))
+        const disabledIndexes: number[] = []
+        let failedCount = 0
+
+        for (const index of indexes) {
+          try {
+            const result = await disableMultiKey(currentRow.id, index)
+            if (result.success) {
+              disabledIndexes.push(index)
+            } else {
+              failedCount++
+            }
+          } catch {
+            failedCount++
+          }
+        }
+
+        if (disabledIndexes.length > 0) {
+          setTestResults((prev) => {
+            const next = new Map(prev)
+            disabledIndexes.forEach((index) => next.delete(index))
+            return next
+          })
+          toast.success(
+            t('{{count}} failed key(s) disabled', {
+              count: disabledIndexes.length,
+            })
+          )
+          queryClient.invalidateQueries({
+            queryKey: channelsQueryKeys.lists(),
+          })
+          await loadKeyStatus(currentPage, pageSize)
+        }
+        if (failedCount > 0) {
+          toast.error(
+            t('{{count}} key(s) could not be disabled', {
+              count: failedCount,
+            })
+          )
+        }
+        return
+      }
+
       let response
 
       // Execute the appropriate action
@@ -194,6 +258,21 @@ export function MultiKeyManageDialog({
       if (response?.success) {
         toast.success(response.message || t('Operation successful'))
         queryClient.invalidateQueries({ queryKey: channelsQueryKeys.lists() })
+
+        if (type === 'disable' && keyIndex !== undefined) {
+          setTestResults((prev) => {
+            const next = new Map(prev)
+            next.delete(keyIndex)
+            return next
+          })
+        }
+        if (
+          type === 'delete' ||
+          type === 'delete-disabled' ||
+          type === 'disable-all'
+        ) {
+          setTestResults(new Map())
+        }
 
         // Reload data - reset to page 1 for bulk actions
         const isBulkAction = type.includes('all') || type === 'delete-disabled'
@@ -231,6 +310,102 @@ export function MultiKeyManageDialog({
   const formatKeyTimestamp = (timestamp?: number) => {
     if (!timestamp) return '-'
     return formatTimestamp(timestamp)
+  }
+
+  // ---- Per-key test logic ----
+
+  const updateTestResult = useCallback(
+    (keyIndex: number, partial: Partial<MultiKeyTestResult>) => {
+      setTestResults((prev) => {
+        const next = new Map(prev)
+        const existing = next.get(keyIndex) || {
+          keyIndex,
+          status: 'idle' as const,
+        }
+        next.set(keyIndex, { ...existing, ...partial })
+        return next
+      })
+    },
+    []
+  )
+
+  const handleTestKey = useCallback(
+    async (keyIndex: number) => {
+      if (!currentRow) return
+      updateTestResult(keyIndex, { status: 'testing', error: undefined })
+      await handleTestChannel(
+        currentRow.id,
+        {
+          channelName: currentRow.name,
+          keyIndex,
+          silent: true,
+        },
+        (success, responseTime?, error?, errorCode?) => {
+          if (success) {
+            updateTestResult(keyIndex, {
+              status: 'success',
+              responseTime,
+              error: undefined,
+              errorCode: undefined,
+            })
+          } else {
+            updateTestResult(keyIndex, {
+              status: 'error',
+              responseTime,
+              error,
+              errorCode,
+            })
+          }
+        }
+      )
+    },
+    [currentRow, updateTestResult]
+  )
+
+  const handleTestAllKeys = useCallback(async () => {
+    if (!currentRow || keys.length === 0) return
+    setTestResults(new Map())
+    setIsTestingAll(true)
+    toast.info(t('Testing all keys...'))
+    for (const key of keys) {
+      await handleTestKey(key.index)
+    }
+    setIsTestingAll(false)
+    toast.success(t('All keys tested'))
+  }, [currentRow, keys, handleTestKey, t])
+
+  const formatTestResult = (result?: MultiKeyTestResult) => {
+    if (!result || result.status === 'idle') return null
+    if (result.status === 'testing') {
+      return (
+        <span className='text-muted-foreground text-xs'>
+          {t('Testing...')}
+        </span>
+      )
+    }
+    if (result.status === 'success') {
+      const time = result.responseTime
+      const timeStr =
+        time !== undefined
+          ? time >= 1000
+            ? `${(time / 1000).toFixed(2)} s`
+            : `${Math.max(1, Math.round(time))} ms`
+          : ''
+      return (
+        <span className='text-sm font-medium text-green-600 dark:text-green-400'>
+          ✓ {timeStr}
+        </span>
+      )
+    }
+    // error
+    return (
+      <span
+        className='max-w-[200px] truncate text-sm font-medium text-red-600 dark:text-red-400'
+        title={result.error || ''}
+      >
+        ✗ {result.error || t('Failed')}
+      </span>
+    )
   }
 
   if (!currentRow) return null
@@ -292,7 +467,7 @@ export function MultiKeyManageDialog({
           <Separator className='shrink-0' />
 
           {/* Toolbar */}
-          <div className='flex shrink-0 items-center justify-between'>
+          <div className='flex shrink-0 flex-wrap items-center justify-between gap-2'>
             <Select
               items={[
                 ...MULTI_KEY_FILTER_OPTIONS.map((option) => ({
@@ -317,7 +492,7 @@ export function MultiKeyManageDialog({
               </SelectContent>
             </Select>
 
-            <div className='flex items-center gap-2'>
+            <div className='flex flex-wrap items-center justify-end gap-2'>
               <Button
                 variant='outline'
                 size='sm'
@@ -326,6 +501,39 @@ export function MultiKeyManageDialog({
               >
                 <RefreshCw className='h-4 w-4' />
               </Button>
+
+              <Button
+                variant='default'
+                size='sm'
+                onClick={handleTestAllKeys}
+                disabled={isLoading || isTestingAll || keys.length === 0}
+              >
+                {isTestingAll ? (
+                  <Loader2 className='mr-2 h-4 w-4 animate-spin' />
+                ) : (
+                  <Zap className='mr-2 h-4 w-4' />
+                )}
+                {t('Test All Keys')}
+              </Button>
+
+              {failedTestKeyIndexes.length > 0 && (
+                <Button
+                  variant='destructive'
+                  size='sm'
+                  onClick={() =>
+                    setConfirmAction({
+                      type: 'disable-failed',
+                      keyIndexes: failedTestKeyIndexes,
+                    })
+                  }
+                  disabled={isTestingAll || isPerformingAction}
+                >
+                  <PowerOff className='mr-2 h-4 w-4' />
+                  {t('Disable Failed ({{count}})', {
+                    count: failedTestKeyIndexes.length,
+                  })}
+                </Button>
+              )}
 
               {manualDisabledCount + autoDisabledCount > 0 && (
                 <Button
@@ -389,7 +597,7 @@ export function MultiKeyManageDialog({
             ) : (
               <StaticDataTable
                 className='rounded-none border-0'
-                tableClassName='min-w-[800px]'
+                tableClassName='min-w-[900px]'
                 data={keys}
                 getRowKey={(key) => key.index}
                 columns={[
@@ -421,6 +629,12 @@ export function MultiKeyManageDialog({
                     cell: (key) => formatKeyTimestamp(key.disabled_time),
                   },
                   {
+                    id: 'test-result',
+                    header: t('Test Result'),
+                    className: 'w-40',
+                    cell: (key) => formatTestResult(testResults.get(key.index)),
+                  },
+                  {
                     id: 'actions',
                     header: t('Actions'),
                     className: 'text-right',
@@ -429,7 +643,9 @@ export function MultiKeyManageDialog({
                         keyIndex={key.index}
                         status={key.status}
                         canDelete={canEditSensitive}
+                        testResult={testResults.get(key.index)}
                         onAction={setConfirmAction}
+                        onTest={handleTestKey}
                       />
                     ),
                   },
