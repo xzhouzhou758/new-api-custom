@@ -72,12 +72,16 @@ func UserCheckin(userId int) (*Checkin, error) {
 	if err := DB.Select("id", "quota").First(&user, "id = ?", userId).Error; err != nil {
 		return nil, errors.New("获取用户信息失败")
 	}
-	// 自定义规则：额度不低于 MinQuotaForCheckin 时不允许签到
-	if user.Quota >= setting.MinQuotaForCheckin {
-		return nil, fmt.Errorf("当前额度 %d 不低于 %d，无需签到", user.Quota, setting.MinQuotaForCheckin)
+	// 自定义规则：额度（显示单位）不低于 MinQuotaForCheckin 时不允许签到
+	// 配置项以显示单位为准，内部按 QuotaPerUnit 换算
+	minQuotaInternal := int(setting.MinQuotaForCheckin * int(common.QuotaPerUnit))
+	if user.Quota >= minQuotaInternal {
+		currentDisplay := int(float64(user.Quota) / common.QuotaPerUnit)
+		return nil, fmt.Errorf("当前额度 %d 不低于 %d，无需签到", currentDisplay, setting.MinQuotaForCheckin)
 	}
-	// 自定义规则：签到把额度补充到 TopUpTargetQuota
-	quotaAwarded := setting.TopUpTargetQuota - user.Quota
+	// 自定义规则：签到把额度补充到 TopUpTargetQuota（显示单位）
+	targetQuotaInternal := int(setting.TopUpTargetQuota * int(common.QuotaPerUnit))
+	quotaAwarded := targetQuotaInternal - user.Quota
 	if quotaAwarded < 0 {
 		quotaAwarded = 0
 	}
