@@ -48,8 +48,9 @@ func enforcePromptTokenPolicy(c *gin.Context, modelName string) bool {
 	}
 	tokenId := common.GetContextKeyInt(c, constant.ContextKeyTokenId)
 	userId := common.GetContextKeyInt(c, constant.ContextKeyUserId)
-	// 无 token / 无用户（如渠道测试、管理端请求）不处理
-	if tokenId == 0 || userId == 0 {
+	// 无用户（系统/内部请求）不处理；渠道测试走 testChannel 自行构造请求，
+	// 不经过 Distribute 中间件，因此不会触发本检查。
+	if userId == 0 {
 		return false
 	}
 	// 仅对文本对话类请求生效（跳过图片/音频/嵌入/重排/实时语音等）
@@ -64,28 +65,36 @@ func enforcePromptTokenPolicy(c *gin.Context, modelName string) bool {
 		return false
 	}
 
-	common.SysLog(fmt.Sprintf("防滥用：userId=%d tokenId=%d，输入 token 数 %d 不在允许范围 [%d, %d]，删除 key",
+	common.SysLog(fmt.Sprintf("防滥用：userId=%d tokenId=%d，输入 token 数 %d 不在允许范围 [%d, %d]",
 		userId, tokenId, promptTokens, minPromptTokensPerRequest, maxPromptTokensPerRequest))
 
-	if err := model.DeleteTokenById(tokenId, userId); err != nil {
-		common.SysError("防滥用：删除 token 失败: " + err.Error())
-	}
-
-	// 累计被删次数，达到上限封号
+	// 累计违规次数，达到上限封号（正式 key 被删与 playground 拦截都计入）
 	if user, err := model.GetUserById(userId, false); err == nil {
 		user.TokenDeletedCount++
 		if err := model.UpdateUserTokenDeletedCount(user.Id, user.TokenDeletedCount); err != nil {
 			common.SysError("防滥用：更新用户删 key 次数失败: " + err.Error())
 		}
 		if user.TokenDeletedCount >= maxTokenDeleteTimes {
-			common.SysLog(fmt.Sprintf("防滥用：userId=%d 累计删 key %d 次，禁用账号", user.Id, user.TokenDeletedCount))
+			common.SysLog(fmt.Sprintf("防滥用：userId=%d 累计违规 %d 次，禁用账号", user.Id, user.TokenDeletedCount))
 			if err := model.UpdateUserStatus(user.Id, common.UserStatusDisabled); err != nil {
 				common.SysError("防滥用：禁用用户失败: " + err.Error())
 			}
 		}
 	}
 
-	abortWithOpenAiMessage(c, http.StatusBadRequest, "你的key已被SHO回收", types.ErrorCodeInvalidRequest)
+	// 仅当请求携带 API token 时执行删 key；无 token（如 playground 会话请求）仅拦截不删 key
+	if tokenId != 0 {
+		if err := model.DeleteTokenById(tokenId, userId); err != nil {
+			common.SysError("防滥用：删除 token 失败: " + err.Error())
+		}
+	}
+
+	// 有 key 的请求提示 key 被回收；无 key（playground）提示本次请求被拦截
+	if tokenId != 0 {
+		abortWithOpenAiMessage(c, http.StatusBadRequest, "你的key已被SHO回收", types.ErrorCodeInvalidRequest)
+	} else {
+		abortWithOpenAiMessage(c, http.StatusBadRequest, "SHO拦截了这次请求", types.ErrorCodeInvalidRequest)
+	}
 	return true
 }
 
