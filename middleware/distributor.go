@@ -32,9 +32,9 @@ type ModelRequest struct {
 
 // 防滥用规则：请求输入 token 数的允许范围与累计删 key 封号阈值
 const (
-	minPromptTokensPerRequest = 20
-	maxPromptTokensPerRequest = 120000
-	maxTokenDeleteTimes       = 2
+	minPromptTokensPerRequest = 1
+	maxPromptTokensPerRequest = 1000000
+	maxTokenDeleteTimes       = 500
 )
 
 // enforcePromptTokenPolicy 在分发渠道前检查单次请求输入 token 数。
